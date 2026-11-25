@@ -111,13 +111,18 @@
 
           <h3 style="font-size:13px;margin:20px 0 6px;">路由表</h3>
           <table>
-            <thead><tr><th style="width:33%">路径</th><th style="width:20%">匹配</th><th>后端</th><th style="width:40px"></th></tr></thead>
+            <thead><tr><th style="width:27%">路径</th><th style="width:16%">匹配</th><th style="width:17%">挂载</th><th>后端</th><th style="width:40px"></th></tr></thead>
             <tbody id="route-rows"></tbody>
           </table>
           <div class="actions">
             <button type="button" class="secondary" id="add-route">+ 添加路由</button>
             <span class="muted">前缀匹配取最长路径；共 {{ max_routes }} 条上限</span>
           </div>
+          <p class="hint" style="margin-top:8px;">
+            挂载仅用于前缀路由：开启后网关转发时去掉该前缀（保留查询串），并把后端指回自身的
+            Location 改写成挂载入口下的公开地址；同一应用可挂在多个路径。若新表中另有规则会
+            截走挂载入口下的路径，发布将被拒绝并列出冲突项，现役配置保持不变。
+          </p>
 
           <div class="actions" style="margin-top:18px;border-top:1px solid var(--line);padding-top:16px;">
             <button class="primary" type="submit">发布整套配置</button>
@@ -179,7 +184,7 @@
           <h3 style="font-size:13px;margin:16px 0 6px;">已生效路由</h3>
           <ul class="routes-list">
             {% for route in gateway.routes %}
-            <li><span class="tag">{{ route.match }}</span> {{ route.path }} → {{ route.backend }}</li>
+            <li><span class="tag">{{ route.match }}</span>{% if route.mount %} <span class="tag">挂载</span>{% endif %} {{ route.path }} → {{ route.backend }}</li>
             {% endfor %}
           </ul>
           {% endif %}
@@ -274,15 +279,31 @@ function addBackendRow(data) {
 
 function addRouteRow(data) {
   const row = document.createElement("tr");
+  const mounted = data.mount === true || data.mount === "1" || data.mount === "true";
   row.innerHTML = `
     <td><input name="route_path" value="${escapeAttr(data.path || "/")}"></td>
-    <td><select name="route_match">
+    <td><select name="route_match" class="route-match">
       <option value="prefix"${data.match === "prefix" ? " selected" : ""}>前缀</option>
       <option value="exact"${data.match === "exact" ? " selected" : ""}>精确</option>
+    </select></td>
+    <td><select name="route_mount" class="route-mount"
+        title="挂载后网关转发时去掉前缀，并重写后端指回自身的 Location">
+      <option value="0"${mounted ? "" : " selected"}>关闭</option>
+      <option value="1"${mounted ? " selected" : ""}>挂载</option>
     </select></td>
     <td><select name="route_backend"></select></td>
     <td><button type="button" class="rowbtn" title="删除">×</button></td>
   `;
+  const matchSelect = row.querySelector(".route-match");
+  const mountSelect = row.querySelector(".route-mount");
+  function syncMountAvailability() {
+    // Mounting only makes sense for prefix routes; an exact rule owns one path.
+    const disabled = matchSelect.value !== "prefix";
+    mountSelect.disabled = disabled;
+    if (disabled && mountSelect.value === "1") mountSelect.value = "0";
+  }
+  matchSelect.addEventListener("change", syncMountAvailability);
+  syncMountAvailability();
   row.querySelector(".rowbtn").addEventListener("click", () => row.remove());
   routeBody.appendChild(row);
   refreshRouteBackends(data.backend);

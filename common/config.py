@@ -50,6 +50,7 @@ class Route:
     path: str
     backend: str
     match: str = "prefix"
+    mount: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,10 +94,42 @@ class GatewayConfig:
                 for b in sorted(self.backends.values(), key=lambda item: item.name)
             ],
             "routes": [
-                {"path": r.path, "match": r.match, "backend": r.backend}
+                {
+                    "path": r.path,
+                    "match": r.match,
+                    "backend": r.backend,
+                    "mount": r.mount,
+                }
                 for r in self.routes
             ],
         }
+
+
+def _path_under(prefix: str, path: str) -> bool:
+    """True when *path* equals *prefix* or is one of its ``/`` sub-paths."""
+    base = prefix.rstrip("/")
+    if base == "":
+        return path.startswith("/")
+    return path == base or path.startswith(base + "/")
+
+
+def find_mount_conflicts(routes: list[Route]) -> list[tuple[Route, Route]]:
+    """Return (mount_route, blocking_route) pairs in table order.
+
+    A mounted prefix route owns its whole public sub-tree.  Any other rule
+    whose path would capture a request underneath that mount steals traffic
+    from it; the publisher must surface the conflict instead of silently
+    publishing a table where the mount entry is unreachable.
+    """
+    conflicts: list[tuple[Route, Route]] = []
+    mounts = [route for route in routes if route.mount]
+    for mount in mounts:
+        for route in routes:
+            if route is mount or route.path == mount.path:
+                continue
+            if _path_under(mount.path, route.path):
+                conflicts.append((mount, route))
+    return conflicts
 
 
 def utc_now_iso() -> str:
@@ -236,6 +269,14 @@ def parse_config(
         path = item.get("path")
         backend = item.get("backend")
         match = item.get("match", "prefix")
+        # Absent / null means "off" so config files written before the mount
+        # feature keep validating; only an explicit bool is otherwise accepted.
+        mount = item.get("mount", False)
+        if mount is None:
+            mount = False
+        if not isinstance(mount, bool):
+            errors.append(f"{label}的 mount 必须是布尔值（true/false）")
+            continue
         if not isinstance(path, str) or not _PATH_RE.fullmatch(path):
             errors.append(f"{label}的 path 必须是以 / 开头的绝对路径")
             continue
@@ -249,6 +290,9 @@ def parse_config(
         if match not in _MATCH_TYPES:
             errors.append(f"{label}的 match 只能是 prefix 或 exact")
             continue
+        if mount and match != "prefix":
+            errors.append(f"{label}只有前缀匹配（prefix）路由可以开启挂载")
+            continue
         if not isinstance(backend, str) or not backend:
             errors.append(f"{label}的 backend 不能为空")
             continue
@@ -259,7 +303,14 @@ def parse_config(
             errors.append(f"路由路径重复：{path}")
             continue
         seen_paths.add(path)
-        routes.append(Route(path=path, backend=backend, match=match))
+        routes.append(Route(path=path, backend=backend, match=match, mount=mount))
+
+    for mount_route, blocking_route in find_mount_conflicts(routes):
+        errors.append(
+            f"挂载路由 {mount_route.path} 与路由 {blocking_route.path}"
+            f"（{blocking_route.match} → {blocking_route.backend}）冲突："
+            f"该规则会截走挂载入口下的路径，请删除或调整其中一条"
+        )
 
     if errors:
         raise ConfigValidationError(errors)

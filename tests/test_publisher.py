@@ -107,6 +107,7 @@ def publish_form(backends, routes):
     for route in routes:
         data.append(("route_path", route["path"]))
         data.append(("route_match", route.get("match", "prefix")))
+        data.append(("route_mount", "1" if route.get("mount") else "0"))
         data.append(("route_backend", route["backend"]))
     return data
 
@@ -134,7 +135,12 @@ def test_publish_valid_config_writes_new_version(publisher):
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["version"] == 2
     assert data["routes"] == [
-        {"path": "/b", "match": "prefix", "backend": "sample-b"}
+        {
+            "path": "/b",
+            "match": "prefix",
+            "backend": "sample-b",
+            "mount": False,
+        }
     ]
 
 
@@ -244,3 +250,76 @@ def test_probe_rejects_bad_input(publisher):
         timeout=10,
     )
     assert response.status_code == 400
+
+
+def test_publish_mounted_route_is_persisted_and_shown(publisher):
+    server, path = publisher
+    seed(path, version=1)
+    response = http.post(
+        server.url + "/publish",
+        data=publish_form(
+            list(CATALOG.items()),
+            [
+                {"path": "/one", "match": "prefix",
+                 "backend": "sample-a", "mount": True},
+                {"path": "/two", "match": "prefix",
+                 "backend": "sample-a", "mount": True},
+            ],
+        ),
+        allow_redirects=False,
+        timeout=10,
+    )
+    assert response.status_code == 302
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["routes"] == [
+        {"path": "/one", "match": "prefix",
+         "backend": "sample-a", "mount": True},
+        {"path": "/two", "match": "prefix",
+         "backend": "sample-a", "mount": True},
+    ]
+    page = http.get(server.url + "/", timeout=10).text
+    assert "挂载" in page
+    # The form is prefilled from the active config with the mount select on.
+    assert '"mount": true' in page
+
+
+def test_publish_mount_conflict_is_rejected_and_active_config_kept(publisher):
+    server, path = publisher
+    seed(path, version=1)
+    before = path.read_text(encoding="utf-8")
+    response = http.post(
+        server.url + "/publish",
+        data=publish_form(
+            list(CATALOG.items()),
+            [
+                {"path": "/demo", "match": "prefix",
+                 "backend": "sample-a", "mount": True},
+                {"path": "/demo/api", "match": "exact", "backend": "sample-b"},
+            ],
+        ),
+        timeout=10,
+    )
+    assert response.status_code == 400
+    text = response.text
+    # Both conflicting entries must be named so the operator can fix them.
+    assert "/demo" in text and "/demo/api" in text and "冲突" in text
+    # Active configuration on disk is untouched.
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_mount_on_exact_match_is_rejected(publisher):
+    server, path = publisher
+    seed(path, version=1)
+    before = path.read_text(encoding="utf-8")
+    response = http.post(
+        server.url + "/publish",
+        data=publish_form(
+            list(CATALOG.items()),
+            [{"path": "/x", "match": "exact",
+              "backend": "sample-a", "mount": True}],
+        ),
+        timeout=10,
+    )
+    assert response.status_code == 400
+    assert "挂载" in response.text
+    assert path.read_text(encoding="utf-8") == before

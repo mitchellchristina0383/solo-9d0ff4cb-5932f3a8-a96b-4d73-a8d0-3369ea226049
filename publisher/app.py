@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from itertools import zip_longest
 from typing import Any
 
 import requests
@@ -149,14 +150,20 @@ def _form_rows(form) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     route_paths = form.getlist("route_path")
     route_matches = form.getlist("route_match")
     route_backends = form.getlist("route_backend")
+    route_mounts = form.getlist("route_mount")
     routes = [
         {
             "path": path.strip(),
             "match": (match or "prefix").strip(),
             "backend": (backend or "").strip(),
+            # The select posts "1"/"0"; anything else is treated as off and
+            # the shared validator still rejects a genuinely wrong JSON type.
+            "mount": (mount or "").strip() == "1",
         }
-        for path, match, backend in zip(route_paths, route_matches, route_backends)
-        if path.strip() or backend.strip()
+        for path, match, backend, mount in zip_longest(
+            route_paths, route_matches, route_backends, route_mounts
+        )
+        if path and (path.strip() or (backend or "").strip())
     ]
     return backends, routes
 
@@ -286,7 +293,12 @@ def create_app() -> Flask:
                 for b in sorted(config.backends.values(), key=lambda i: i.name)
             ]
             form_routes = [
-                {"path": r.path, "match": r.match, "backend": r.backend}
+                {
+                    "path": r.path,
+                    "match": r.match,
+                    "backend": r.backend,
+                    "mount": r.mount,
+                }
                 for r in config.routes
             ]
         else:
@@ -294,7 +306,12 @@ def create_app() -> Flask:
                 {"name": name, "url": url} for name, url in sorted(catalog.items())
             ]
             form_routes = [
-                {"path": f"/{name}", "match": "prefix", "backend": name}
+                {
+                    "path": f"/{name}",
+                    "match": "prefix",
+                    "backend": name,
+                    "mount": False,
+                }
                 for name, _url in sorted(catalog.items())
             ]
         published = request.args.get("published")

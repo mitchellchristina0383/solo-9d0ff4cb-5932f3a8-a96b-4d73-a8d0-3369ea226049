@@ -16,6 +16,7 @@ from werkzeug.exceptions import HTTPException
 
 from common.config import GatewayConfig, catalog_from_env
 from gateway.config_store import ConfigStore
+from gateway.mount import rewrite_location, strip_mount_prefix
 
 LOG = logging.getLogger("gateway")
 
@@ -172,6 +173,16 @@ def _json_error(
     return _json_response(status, payload, config, backend=backend)
 
 
+def redirect_response(location: str) -> Response:
+    """308 Permanent Redirect: keeps method and body for POST submissions."""
+    response = Response(status=308)
+    response.headers["Location"] = location
+    # A redirect never carries a body; stop clients from caching it forever so
+    # a later publish that changes the mount can take effect.
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def _relay_body(upstream: requests.Response) -> Iterable[bytes]:
     try:
         for chunk in upstream.iter_content(chunk_size=16384):
@@ -241,7 +252,12 @@ def create_app() -> Flask:
                 for b in sorted(config.backends.values(), key=lambda i: i.name)
             ]
             payload["routes"] = [
-                {"path": r.path, "match": r.match, "backend": r.backend}
+                {
+                    "path": r.path,
+                    "match": r.match,
+                    "backend": r.backend,
+                    "mount": r.mount,
+                }
                 for r in config.routes
             ]
         return _json_response(200 if config is not None else 503, payload, config)
@@ -281,8 +297,29 @@ def create_app() -> Flask:
                 path=request_path,
             )
 
+        raw_target_path = _raw_path()
+        if route.mount:
+            # An app mounted at a sub-path is addressed relative to its own
+            # root.  The entry without a trailing slash is normalised first so
+            # the browser's relative references resolve inside the mount; the
+            # query string is carried across the redirect (the fragment stays
+            # with the browser and is never sent to the server).
+            if request_path == route.path.rstrip("/"):
+                target_location = raw_target_path + "/"
+                if request.query_string:
+                    target_location += "?" + request.query_string.decode("latin-1")
+                response = redirect_response(target_location)
+                response.headers["X-Gateway-Backend"] = route.backend
+                response.headers["X-Gateway-Route"] = route.path
+                response.headers["X-Gateway-Config-Version"] = str(config.version)
+                response.headers["X-Gateway-Request-Id"] = g.request_id
+                return response
+            upstream_path = strip_mount_prefix(raw_target_path, route.path)
+        else:
+            upstream_path = raw_target_path
+
         backend = config.backends[route.backend]
-        target = backend.url + _raw_path()
+        target = backend.url + upstream_path
         if request.query_string:
             target += "?" + request.query_string.decode("latin-1")
 
@@ -339,6 +376,20 @@ def create_app() -> Flask:
             else:
                 response.headers[name] = value
                 replaced.add(lower)
+        location_present = any(
+            name.lower() == "location" for name, _value in response.headers
+        )
+        if route.mount and location_present:
+            # Upstream redirects back to its own origin must keep the browser
+            # inside the public mount; off-site locations pass through.
+            response.headers["Location"] = rewrite_location(
+                response.headers["Location"],
+                backend_url=backend.url,
+                mount_path=route.path,
+                public_scheme=request.scheme,
+                public_host=request.host,
+                base_path=upstream_path,
+            )
         response.headers["X-Gateway-Backend"] = backend.name
         response.headers["X-Gateway-Route"] = route.path
         response.headers["X-Gateway-Config-Version"] = str(config.version)
